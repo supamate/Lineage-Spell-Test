@@ -79,10 +79,13 @@ DEFAULTS = {
     # this much lower; while mana is not charging the bottom is this much higher.
     'charge_trim': 1.0, 'drain_trim': 1.0,
     # How far the bar on screen trails your real mana while it moves (learned from every quick cast).
-    'charge_lag_ms': 120.0, 'charge_lags': [], 'charge_speeds': [],
+    'charge_lag_ms': 120.0, 'charge_lags': [], 'charge_speeds': [], 'rise_delays': [],
     # Quick cast: when G is pressed but mana doesn't start charging (a half-stun from a dash or a move), G is tapped
-    # again this often until it does.
+    # again - never sooner than this after the last press, and never before a charge would have shown on the bar.
     'g_retry_ms': 110.0,
+    # Quick cast: time between pressing the spell's hotbar key and the click (the spell is only taken out once mana
+    # is in range).
+    'qc_equip_ms': 30.0,
     'quick': [], 'qc_extra': 1.0, 'qc_timeout': 25.0,  # quick cast: [{'key': 'y', 'spell': 'Snap Snarvindur'}]
 }
 
@@ -819,6 +822,9 @@ class Core:
             self.lag = sorted(self._lags)[len(self._lags) // 2]
         self._probe = None           # after quick cast lets go of G: watch where the bar peaks, to learn the lag
         self._speeds = [float(v) for v in (cfg.get('charge_speeds') or []) if (_num(v) or 0) > 3][-9:]
+        self.user_hot_t = 0.0        # last time YOU pressed a hotbar key (a quick cast stops when you pick a slot)
+        # how long after a G press the bar visibly starts rising (lag + the charge's slow start), learned
+        self._rises = [float(v) for v in (cfg.get('rise_delays') or []) if 0.02 < (_num(v) or 0) < 1.5][-9:]
         self._rise_since = None
         self._speed_t = 0.0
         self._bc_args = None
@@ -1150,6 +1156,19 @@ class Core:
         dev = sorted(abs(x - m) for x in s)
         return m, max(0.01 * m, 1.4826 * dev[len(dev) // 2])
 
+    def _add_rise(self, v):
+        self._rises = (self._rises + [min(1.5, max(0.02, v))])[-9:]
+        self.cfg['rise_delays'] = [round(x, 3) for x in self._rises]
+        self.lag_dirty = True
+
+    def stun_wait(self):
+        """How long after pressing G a charge would surely be visible. Re-tapping sooner would restart a charge that
+        is working (its slow start makes it show late) - that is how a tap-charging loop happens."""
+        if len(self._rises) >= 3:
+            r = sorted(self._rises)
+            return max(r[len(r) // 2] * 1.5, r[-1]) + 0.05
+        return max(self.lag + 0.2, 0.45)
+
     def lag_spread(self):
         """How much the lag varies between casts (robust standard deviation); None until 4 casts are known."""
         if len(self._lags) < 4:
@@ -1230,43 +1249,28 @@ class Core:
                 self.job_label = ''
 
     def _job_quick(self, name):
-        """Quick cast: equip the spell if it isn't in your hand, bring mana into its range (hold G to charge up
-        to a little above the minimum, or wait while it drains down), then cast."""
+        """Quick cast: charge mana into the spell's range (hold G, or wait while it drains down), and only then take
+        the spell out and cast it."""
         s = self.spell_named(name)
         if s is None:
             self._note('quick cast: no listed spell called "%s"' % name)
             return
         key, click, a, b, name = s
         t0 = time.time()
+        user_t = self.user_hot_t
         scan = next(sc for sc, k in HOTBAR_SCAN.items() if k == key)
-        tries = 0
-        while self.armed != key:                         # take it out
-            if tries >= 3:
-                self._note('quick cast: could not equip %s' % name)
-                return
-            tries += 1
-            self._hold('k', scan, True)
-            t1 = time.time()
-            while time.time() - t1 < KEY_HOLD:
-                yield
-            self._hold('k', scan, False)
-            while time.time() - t1 < 0.30 and self.armed != key:
-                yield
         low = a if a <= 0 else a + _num(self.cfg.get('qc_extra'), 1.0)     # never cast right at the minimum
         top = b if b >= 100 else b - _num(self.cfg.get('charge_trim'), 1.0)
-        center = (max(low, a) + top) / 2.0
+        center = (max(low, a) + top) / 2.0           # aim for the middle: room on both sides
+        s2 = self.shifted(s, False)                  # not charging: the bottom of the range is a bit higher
+        lo_ok, hi_ok = max(low, s2[2]), s2[3]
         lead = _num(self.cfg.get('cast_lead_ms'), 70.0) / 1000.0
-        retry = max(0.05, _num(self.cfg.get('g_retry_ms'), 110.0) / 1000.0)
-        charging = False
-        released = None                              # (time, bar %, rate, predicted rest or None) when G was let go
+        charging, released = False, None             # released = (time, bar %, bar speed) when G was let go
         g_t = g_base = 0.0
         g_ok, presses, stun_noted = False, 0, False
-        hold_until = None                            # timed charge: when to let go of G
-        aim = center
-        press_ts, t_start, tbase, lost, timed_extra = [], 0.0, 0.0, 0.0, 0.0
         while time.time() - t0 < _num(self.cfg.get('qc_timeout'), 25.0):
-            if self.armed != key:
-                self._note('quick cast stopped: %s is no longer in your hand' % name)
+            if self.user_hot_t != user_t:
+                self._note('quick cast stopped: you picked another slot')
                 return
             now = time.time()
             at, pct, src = self.reading
@@ -1276,27 +1280,15 @@ class Core:
                     charging, released = False, None
                 yield
                 continue
-            R, R_sd = self.charge_speed()
             if charging:
                 if not g_ok:
                     if pct - g_base >= 0.8 or self.rate > 10.0:
                         g_ok = True                      # the bar is rising: the charge took
-                        if presses > 1 and R:
-                            # re-tapped through a stun: the press that worked is the last one sent at least one lag
-                            # before the rise showed; each later tap paused the charge for G_TAP_GAP
-                            seen_from = now - self.lag + 0.03
-                            okp = [pt for pt in press_ts if pt[0] <= seen_from] or press_ts[:1]
-                            t_start, tbase = okp[-1]
-                            lost = G_TAP_GAP * sum(1 for pt in press_ts if pt[0] > t_start)
-                            timed_extra = R * 0.015  # a little less sure than a clean single press
-                            # aim where the no-wait cast is allowed (low edge + its own uncertainty), never past the middle
-                            need = 2.5 * R_sd * max(0.05, (center - tbase) / R) + R * 0.012 + 0.6 + timed_extra
-                            aim = min(center, max(aim, low + need + 0.3))
-                            hold_until = t_start + lost + (aim - tbase) / R
-                    elif now - g_t >= ((self.lag if len(self._lags) >= 3 else max(self.lag, 0.3)) + 0.06
-                                       if presses == 1 else retry) and \
-                            (hold_until is None or now < hold_until):
-                        # G is down but mana isn't charging (half-stun from a dash / a move): tap G again
+                        if presses == 1:
+                            self._add_rise(now - g_t)
+                    elif now - g_t >= max(self.stun_wait(), _num(self.cfg.get('g_retry_ms'), 110.0) / 1000.0):
+                        # A charge would have shown by now: G isn't charging (half-stun from a dash / a move).
+                        # Tap G again. (Never sooner: a tap restarts the charge's slow start.)
                         if not stun_noted:
                             stun_noted = True
                             self._note('quick cast: mana not charging (stunned?) - tapping G until it does')
@@ -1305,56 +1297,29 @@ class Core:
                         while time.time() - t1 < G_TAP_GAP:
                             yield
                         self._hold('k', G_SCAN, True)
-                        g_t, g_base, presses, hold_until = time.time(), pct, presses + 1, None
-                        press_ts.append((g_t, pct))
+                        g_t, g_base, presses = time.time(), pct, presses + 1
                         yield
                         continue
-                if hold_until is not None:
-                    go = now >= hold_until               # timed: G held exactly long enough
-                else:
-                    # the bar trails the real mana: let go when it will come to REST at the aim point (with the
-                    # learned charge speed - the bar's own speed reads too low right after it starts moving)
-                    r_use = max(self.rate, R or 0.0)
-                    go = pct + r_use * self.lag >= aim or pct >= top
-                if go:
+                # The bar trails the real mana: let go when it will come to REST in the middle of the range. How far
+                # it keeps going after G is let go is learned from every quick cast (median of the last 9).
+                if g_ok and (pct + max(self.rate, 0.0) * self.lag >= center or pct >= top):
                     self._hold('k', G_SCAN, False)
-                    pred = None
-                    if hold_until is not None and R and g_ok:
-                        # timed, and the bar has SHOWN the charge rising (a stun can't fool it)
-                        pred = tbase + R * (time.time() - t_start - lost)
-                    charging, released = False, (now, pct, max(self.rate, 0.0), pred)
-                    if presses == 1:                     # re-tapped (stun): its timing says nothing about the lag
-                        self._start_probe(now, pct, max(self.rate, R or 0.0) if g_ok else 0.0)
-                    elif pred is None:
-                        released = (now, pct, max(self.rate, 0.0), None, 'retapped')
+                    charging, released = False, (now, pct, max(self.rate, 0.0))
+                    if presses == 1:                     # after re-taps the timing says nothing about the lag
+                        self._start_probe(now, pct, max(self.rate, 0.0))
                 yield
                 continue
-            s2 = self.shifted(s, False)                  # not charging: the bottom of the range is a bit higher
             if released is not None:
-                t_rel, d0, r0, pred = released[:4]
-                unc = None
-                if len(released) > 4:
-                    pass                                 # after re-tapping G: only trust what the bar shows
-                elif pred is not None and R_sd is not None:
-                    # timed charge with a known charge speed: where it stopped is known without waiting for the bar
-                    unc = 2.5 * R_sd * (t_rel - t_start) + R * 0.012 + 0.6 + timed_extra
-                else:
-                    spread = self.lag_spread()
-                    if spread is not None and r0 > 15.0:
-                        pred = d0 + max(r0, R or 0.0) * self.lag     # the lag has proven steady
-                        unc = 2.0 * spread * max(r0, R or 0.0) + 0.6
-                if unc is not None:
-                    if max(low, s2[2]) + unc <= pred <= s2[3] - unc:
+                t_rel, d0, r0 = released
+                spread = self.lag_spread()
+                if spread is not None and r0 > 15.0:
+                    pred = d0 + r0 * self.lag            # the overshoot has proven steady: no need to wait
+                    unc = 2.0 * spread * r0 + 0.6
+                    if lo_ok + unc <= pred <= hi_ok - unc:
                         while time.time() - t_rel < FAST_AFTER:
                             yield
-                        self._hold('m', click, True)
-                        self.casts += 1
-                        self.last_cast_t = time.time()
+                        yield from self._take_out_and_cast(key, scan, click)
                         self._note('quick cast (%s click): %s, stopped at ~%.1f%% (fast)' % (click, name, pred))
-                        t1 = time.time()
-                        while time.time() - t1 < CLICK_HOLD:
-                            yield
-                        self._hold('m', click, False)
                         return
                 if now - t_rel < 0.06:
                     yield                                # G just went up: the bar is still catching up
@@ -1365,30 +1330,32 @@ class Core:
             released = None
             ahead = min(100.0, max(0.0, pct + min(self.rate, 0.0) * lead))
             if pct >= low and self.allows(pct, [s2]) and self.allows(ahead, [s2]):
-                self._hold('m', click, True)             # the bar has caught up and is inside the range: cast
-                self.casts += 1
-                self.last_cast_t = time.time()
+                yield from self._take_out_and_cast(key, scan, click)      # in range: NOW take the spell out
                 self._note('quick cast (%s click): %s, mana %.1f%%' % (click, name, pct))
-                t1 = time.time()
-                while time.time() - t1 < CLICK_HOLD:
-                    yield
-                self._hold('m', click, False)
                 return
             if pct < low:                                # below the range (or came to rest short of it): charge
-                R, R_sd = self.charge_speed()
-                if R:
-                    # Aim for the middle once the charge speed is well known, a bit lower while it isn't: coming
-                    # up short costs a quick top-up, going over costs waiting for the mana to drain.
-                    unc_aim = 2.5 * R_sd * max(0.05, (center - pct) / R) + R * 0.012 + 0.6
-                    aim = min(center, max(low + unc_aim, (low + center) / 2.0))
-                else:
-                    aim = low + (top - low) * 0.35
                 self._hold('k', G_SCAN, True)
                 charging, g_ok, g_t, g_base, presses = True, False, time.time(), pct, 1
-                hold_until = (g_t + (aim - pct) / R) if R else None
-                press_ts, t_start, tbase, lost, timed_extra = [(g_t, pct)], g_t, pct, 0.0, 0.0
             yield                                        # above the range: wait while it drains
         self._note('quick cast gave up on %s (mana never got into its range)' % name)
+
+    def _take_out_and_cast(self, key, scan, click):
+        """Mana is in range: take the spell out (only if it isn't in your hand already), then click."""
+        if self.armed != key:
+            self._hold('k', scan, True)
+            t1 = time.time()
+            while time.time() - t1 < KEY_HOLD:
+                yield
+            self._hold('k', scan, False)
+            while time.time() - t1 < _num(self.cfg.get('qc_equip_ms'), 30.0) / 1000.0:
+                yield
+        self._hold('m', click, True)
+        self.casts += 1
+        self.last_cast_t = time.time()
+        t1 = time.time()
+        while time.time() - t1 < CLICK_HOLD:
+            yield
+        self._hold('m', click, False)
 
     def _note(self, text):
         self.last_event = (time.time(), text)
@@ -1494,6 +1461,7 @@ class Core:
             key = HOTBAR_SCAN[scan]
             self.armed = None if self.armed == key else key     # same key again = put away
             self.key_t = now
+            self.user_hot_t = now
         return False
 
     def _ms(self, code, wparam, lparam):

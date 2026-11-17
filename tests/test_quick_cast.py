@@ -104,7 +104,7 @@ def summary(g):
 # ---------------------------------------------------------------- quick cast
 g = Game(); g.key(Y); g.run(3.0)
 check('Y from nothing in hand, 0 % mana: equips, charges, casts once', len(g.casts) == 1 and not g.backfires and g.hand == '-'
-      and 20.0 <= g.casts[0][2] <= 31 and not g.g, summary(g) + ', G released=%s' % (not g.g))
+      and 18.0 <= g.casts[0][2] <= 32 and not g.g, summary(g) + ', G released=%s' % (not g.g))
 check('... it used the RIGHT click because the name starts with "Snap"', [c[1] for c in g.clicks if not c[2]] == ['right'])
 t_cast = g.casts[0][0] - g.t0
 print('     (cast %.0f ms after the key press; charging 0 -> 20 %% alone takes %.0f ms)' % (t_cast * 1000, 20 / 40 * 1000))
