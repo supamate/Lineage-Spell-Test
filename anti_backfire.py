@@ -58,9 +58,7 @@ PUT_GAP = 0.05                 # ... but putting a spell AWAY is urgent: it only
 KEY_HOLD = 0.015               # how long it holds a hotbar key down
 F_SCAN, G_SCAN = 0x21, 0x22     # F = block / mana shield, G = charge mana
 CLICK_HOLD = 0.03              # how long a click sent by a sequence is held
-ARM_FOR = 0.45                 # an X press while charging stays "wanted" this long (keep tapping to keep it)
 CAST_LOCK = 0.4                # after a cast, no second click for this long (the bar is still catching up)
-SETTLE_MAX = 0.45              # longest wait for the bar to stand still after the charge is stopped
 HYST = 0.7                     # % deeper inside the range before the spell is taken OUT than to keep it out
 INTENT_TIMEOUT = 20.0          # a put-away spell is forgotten after this long with no mana charged
 
@@ -75,10 +73,11 @@ DEFAULTS = {
     # Viribus backcast, as viri.ahk REALLY runs on this PC (measured: its "sleep 425" after the click puts F
     # down ~488 ms after the click goes down, the click is held ~32 ms, F is held ~579 ms)
     'vir_wait_ms': 488.0, 'vir_hold_ms': 579.0, 'vir_click_ms': 32.0,
-    # Casting while you hold G (charging). The bar on screen trails the real mana, and at a fast charge that is
-    # several %: a click sent on a moving bar can land outside the range. For these spells (part of the name; '*' =
-    # all) X instead stops the charge at the right moment, waits until the bar stands still, checks it, then casts.
-    'settle_spells': ['snarvindur'], 'charge_lag_ms': 120.0,
+    # Hidden range shift by direction (never shown on the bar): while you charge (G held) the top of every range is
+    # this much lower; while mana is not charging the bottom is this much higher.
+    'charge_trim': 1.0, 'drain_trim': 1.0,
+    # How far the bar on screen trails your real mana while it moves (learned from every quick cast).
+    'charge_lag_ms': 120.0,
     'quick': [], 'qc_extra': 1.0, 'qc_timeout': 25.0,  # quick cast: [{'key': 'y', 'spell': 'Snap Snarvindur'}]
 }
 
@@ -708,10 +707,7 @@ class Core:
         self._down = set()           # keys / buttons a sequence is holding down
         self._bc_active = False      # a Viribus backcast is running (its own precisely timed thread)
         self.g_phys = False          # you are physically holding G
-        self.g_hide = False          # the add-on let go of G for the game: your held G is hidden until you release it
-        self.x_arm_t = 0.0           # last X press while charging a settle spell
         self.last_cast_t = 0.0       # last click this add-on sent for a cast
-        self._arm_log_t = 0.0
         self.lag = min(0.5, max(0.02, _num(cfg.get('charge_lag_ms'), 120.0) / 1000.0))   # how far the bar trails, learned
         self.lag_dirty = False
         self._bc_args = None
@@ -858,7 +854,6 @@ class Core:
                     else:
                         del self._hist[:]
                         self.rate = 0.0
-                    self._charge_control(now)
                     self._advance_job(self.chat or not self.cfg.get('enabled'))
                     wait = SAMPLE_EVERY
                 else:
@@ -925,18 +920,37 @@ class Core:
             return None
         return min(s[2] for s in sp), max(s[3] for s in sp), sp[0][4]
 
+    def charging(self):
+        """G is held for the game: by you, or by a quick cast."""
+        return self.g_phys or ('k', G_SCAN) in self._down
+
+    def shifted(self, s, charging):
+        """The range actually used (never shown): charging -> the top is lower; not charging -> the bottom is higher."""
+        key, click, a, b, name = s
+        if charging:
+            if b < 100:
+                b -= _num(self.cfg.get('charge_trim'), 1.0)
+        elif a > 0:
+            a += _num(self.cfg.get('drain_trim'), 1.0)
+        return key, click, a, b, name
+
     def castable(self, now=None):
         """-> (spell entry to cast or None, mana %, held entries). An entry is castable while the mana bar is
-        inside its range - both where it is now and where it will be when the click lands (it keeps moving while
-        you charge). A spell with a left AND a right entry casts whichever one the mana is in range for."""
+        inside its (hidden-shifted) range - both where it is now and where it really is when the click lands: while
+        the bar rises it trails your real mana, so the look-ahead is at least that learned lag."""
         now = time.time() if now is None else now
         sp = self.held()
         at, pct, src = self.reading
         if not sp or pct is None or now - at > STALE:
             return None, (pct if sp else None), sp
-        ahead = min(100.0, max(0.0, pct + self.rate * _num(self.cfg.get('cast_lead_ms'), 70.0) / 1000.0))
+        lead = _num(self.cfg.get('cast_lead_ms'), 70.0) / 1000.0
+        if self.rate > 0:
+            lead = max(lead, self.lag)
+        ahead = min(100.0, max(0.0, pct + self.rate * lead))
+        ch = self.charging()
         for s in sp:
-            if self.allows(pct, [s]) and self.allows(ahead, [s]):
+            s2 = self.shifted(s, ch)
+            if self.allows(pct, [s2]) and self.allows(ahead, [s2]):
                 return s, pct, sp
         return None, pct, sp
 
@@ -955,15 +969,6 @@ class Core:
         now = time.time()
         what = 'mana bar not readable' if pct is None else 'mana %.1f%%' % pct
         vir = next((e for e in sp if 'viribus' in e[4].lower()), None)
-        se = self._settle_entry(sp)
-        if se is not None and self.g_phys and not self.g_hide:
-            # You are charging: the bar is moving, so no click now. The reader thread stops the charge at the
-            # right moment and casts once the bar stands still (see _charge_control).
-            self.x_arm_t = now
-            if now - self._arm_log_t > 1.5:
-                self._arm_log_t = now
-                self._note('charging: will stop the charge and cast %s when it is safe, %s' % (se[4], what))
-            return True
         if s is not None:
             send_button(s[1], False)
             self.cast_btn = s[1]
@@ -990,68 +995,20 @@ class Core:
             send_button(self.cast_btn, True)
             self.cast_btn = None
 
-    # -- casting while charging ---------------------------------------------------------------------------
-    def _settle_entry(self, sp):
-        subs = [str(x).lower() for x in (self.cfg.get('settle_spells') or ())]
-        return next((e for e in sp if '*' in subs or any(x and x in e[4].lower() for x in subs)), None)
-
+    # -- the moving bar ---------------------------------------------------------------------------------------
     def _steady(self, now):
-        """The bar has stood still for the last ~70 ms."""
-        pts = [v for at, v in self._hist if now - at <= 0.07]
-        return len(pts) >= 3 and max(pts) - min(pts) <= 0.5
+        """The bar is not rising any more (standing still, or draining slowly) over the last ~70 ms."""
+        pts = [(at, v) for at, v in self._hist if now - at <= 0.07]
+        return len(pts) >= 3 and pts[-1][1] - pts[0][1] <= 0.4
 
-    def _charge_control(self, now):
-        """You hold G and tapped X: let go of G for the game at the moment the bar will come to rest in the
-        middle of the spell's range (the bar trails the real mana by `lag`, which is learned from every stop)."""
-        if self.job is not None or self._bc_active or not self.cfg.get('enabled') or self.chat:
-            return
-        if not self.g_phys or self.g_hide or now - self.x_arm_t > ARM_FOR or now - self.last_cast_t < CAST_LOCK:
-            return
-        se = self._settle_entry(self.held())
-        at, pct, src = self.reading
-        if se is None or pct is None or now - at > STALE:
-            return
-        a, b = se[2], se[3]
-        rest = pct + max(self.rate, 0.0) * self.lag          # where the bar will come to rest if G goes up now
-        if rest >= (a + b) / 2.0 or (self.rate < 4.0 and self.allows(pct, [se])):
-            self._start(self._job_settle(se, pct, self.rate), 'stopping the charge')
-
-    def _job_settle(self, se, d0, r0):
-        key, click, a, b, name = se
-        t0 = time.time()
-        self.g_hide = True
-        send_scan(G_SCAN, True)                              # the game sees G released: charging stops
-        ok = False
-        while time.time() - t0 < SETTLE_MAX:
-            yield
-            now = time.time()
-            if self.armed != key:
-                break
-            if now - t0 >= 0.05 and self._steady(now):
-                ok = True
-                break
-        at, pct, src = self.reading
-        if ok and pct is not None and r0 > 15.0:             # learn how far the bar trails the real mana
+    def _learn_lag(self, d0, r0, pct):
+        """G went up with the bar at d0 rising r0 %/s; it came to rest at pct. The difference is how far the bar
+        trails the real mana (incl. the time the key takes to reach the game)."""
+        if r0 > 15.0 and pct is not None:
             new = min(0.5, max(0.02, (pct - d0) / r0))
-            self.lag = 0.5 * self.lag + 0.5 * new
+            self.lag = 0.6 * self.lag + 0.4 * new
             self.cfg['charge_lag_ms'] = round(self.lag * 1000.0, 1)
             self.lag_dirty = True
-        if ok and pct is not None and self.allows(pct, [se]):
-            self._hold('m', click, True)                     # the bar stands still inside the range: cast
-            self.casts += 1
-            self.last_cast_t = time.time()
-            # G is NOT given back: charging again before the click has landed would push the mana out of the
-            # range. The charge stays stopped until you let go of G and press it again.
-            self._note('cast (%s click) after stopping the charge: %s, mana %.1f%%' % (click, name, pct))
-            t1 = time.time()
-            while time.time() - t1 < CLICK_HOLD:
-                yield
-            self._hold('m', click, False)
-        else:
-            self.flash_t = time.time()
-            self._note('held back: %s came to rest at %s (casts at %g-%g%%). The charge stays stopped: X casts once '
-                       'mana is in range; let go of G and press it again to charge.'
-                       % (name, '?' if pct is None else '%.1f%%' % pct, a, b))
 
     # -- sequences (run step by step by the reader thread, every few ms) --------------------------------------
     def _start(self, gen, label):
@@ -1148,39 +1105,55 @@ class Core:
             while time.time() - t1 < 0.30 and self.armed != key:
                 yield
         low = a if a <= 0 else a + _num(self.cfg.get('qc_extra'), 1.0)     # never cast right at the minimum
+        top = b if b >= 100 else b - _num(self.cfg.get('charge_trim'), 1.0)
+        aim = (max(low, a) + top) / 2.0              # where the bar should come to rest: the middle of what is safe
         lead = _num(self.cfg.get('cast_lead_ms'), 70.0) / 1000.0
         charging = False
+        released = None                              # (time, bar %, rate) when G was let go
         while time.time() - t0 < _num(self.cfg.get('qc_timeout'), 25.0):
             if self.armed != key:
                 self._note('quick cast stopped: %s is no longer in your hand' % name)
                 return
+            now = time.time()
             at, pct, src = self.reading
-            if pct is None or time.time() - at > STALE:
+            if pct is None or now - at > STALE:
                 if charging:                             # can't see the bar: don't charge blind
                     self._hold('k', G_SCAN, False)
-                    charging = False
+                    charging, released = False, None
                 yield
                 continue
-            ahead = min(100.0, max(0.0, pct + self.rate * lead))
-            if pct >= low and self.allows(pct, [s]) and self.allows(ahead, [s]):
-                self._hold('m', click, True)             # in range, and still in range when the click lands: cast
-                self.casts += 1
-                self._note('quick cast (%s click): %s, mana %.1f%%' % (click, name, pct))
-                if charging:
+            if charging:
+                # The bar trails the real mana: let go of G when the bar will come to REST at the aim point.
+                if pct + max(self.rate, 0.0) * self.lag >= aim or pct >= top:
                     self._hold('k', G_SCAN, False)
+                    charging, released = False, (now, pct, max(self.rate, 0.0))
+                yield
+                continue
+            if released is not None and now - released[0] < 0.06:
+                yield                                    # G just went up: the bar is still catching up
+                continue
+            if not self._steady(now):
+                yield                                    # still rising: wait until it has caught up
+                continue
+            if released is not None:
+                self._learn_lag(released[1], released[2], pct)
+                released = None
+            s2 = self.shifted(s, False)                  # not charging: the bottom of the range is a bit higher
+            ahead = min(100.0, max(0.0, pct + min(self.rate, 0.0) * lead))
+            if pct >= low and self.allows(pct, [s2]) and self.allows(ahead, [s2]):
+                self._hold('m', click, True)             # the bar has caught up and is inside the range: cast
+                self.casts += 1
+                self.last_cast_t = time.time()
+                self._note('quick cast (%s click): %s, mana %.1f%%' % (click, name, pct))
                 t1 = time.time()
                 while time.time() - t1 < CLICK_HOLD:
                     yield
                 self._hold('m', click, False)
                 return
-            if pct < low:
-                if not charging:                         # below the range: charge
-                    self._hold('k', G_SCAN, True)
-                    charging = True
-            elif charging:                               # reached it but moving too fast to cast safely, or past it
-                self._hold('k', G_SCAN, False)
-                charging = False
-            yield
+            if pct < low:                                # below the range (or came to rest short of it): charge
+                self._hold('k', G_SCAN, True)
+                charging = True
+            yield                                        # above the range: wait while it drains
         self._note('quick cast gave up on %s (mana never got into its range)' % name)
 
     def _note(self, text):
@@ -1223,11 +1196,7 @@ class Core:
         """-> True when the key is one of this add-on's own (cast key / quick cast) and is hidden from the game."""
         ident = (scan, ext)
         if scan == G_SCAN and not ext and not ours:
-            self.g_phys = down
-            if not down:
-                self.g_hide = False              # you let go of G: from the next press on it is yours again
-            elif self.g_hide:
-                return True                      # still held, but the charge was stopped for the game: keep it so
+            self.g_phys = down                   # you are charging (only watched, never taken)
         if ident in self._eaten:                 # a key of ours that is down: its repeats and its release
             if not down:
                 self._eaten.discard(ident)
@@ -1427,6 +1396,7 @@ def run_ui():
     st.map('TCombobox', fieldbackground=[('readonly', FIELD)], foreground=[('readonly', FG)])
     root.option_add('*TCombobox*Listbox.background', FIELD)
     root.option_add('*TCombobox*Listbox.foreground', FG)
+    cfg.pop('settle_spells', None)                   # the old stop-and-settle switch (replaced by the hidden shift)
     if cfg.get('vir_v') != 2:                        # old values were viri.ahk's nominal sleeps, not the real timing
         cfg['vir_v'] = 2
         if _num(cfg.get('vir_wait_ms')) == 425.0:
@@ -1568,8 +1538,8 @@ def run_ui():
                    "(right click for a snap,\nleft click otherwise) only while mana is inside the range; outside it "
                    "does nothing. The spell stays in your hand.\nYour own mouse clicks are not protected. "
                    "Viribus out of range: backfired on purpose and mana-shielded for you.\n"
-                   "Holding G and tapping X (Snap Snarvindur): the charge is stopped for you at the right moment and "
-                   "it casts once the bar stands still.\nAfter that, let go of G and press it again to charge."
+                   "While you hold G the range quietly ends a little earlier (and X allows for how far the bar "
+                   "trails), when you don't, it starts a little later."
                    % str(cfg.get('cast_key', 'x')).upper()).pack(anchor='w', padx=10, pady=(0, 6))
 
     # ---- quick cast menu
