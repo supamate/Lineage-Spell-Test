@@ -60,6 +60,7 @@ F_SCAN, G_SCAN = 0x21, 0x22     # F = block / mana shield, G = charge mana
 CLICK_HOLD = 0.03              # how long a click sent by a sequence is held
 FAST_AFTER = 0.03              # quick cast, confident: click this long after G goes up (the charge has stopped)
 G_TAP_GAP = 0.02               # quick cast re-tapping G: how long G is up between two presses
+X_ARM_FOR = 0.5                # an X press that was held back keeps trying this long (or while X is held)
 CAST_LOCK = 0.4                # after a cast, no second click for this long (the bar is still catching up)
 HYST = 0.7                     # % deeper inside the range before the spell is taken OUT than to keep it out
 INTENT_TIMEOUT = 20.0          # a put-away spell is forgotten after this long with no mana charged
@@ -835,6 +836,11 @@ class Core:
         self._rise_open = False
         self.rate_short = 0.0        # bar speed over only the last ~45 ms (to tell a steady rise from a speeding-up one)
         self.x_why = ''              # why the last X decision went the way it did (written to the log)
+        self.x_arm_until = 0.0       # X was pressed but held back: cast at the first safe moment until then
+        self.x_arm_key = None
+        self.x_key_down = False
+        self._x_up_t = 0.0           # when to let go of a click sent by an armed X
+        self._x_btn = None
         self.rate_ok = False         # enough recent readings to know how fast the bar moves
         self.sample_dt = None        # average time between two mana readings
         self._slots_t = 0.0
@@ -996,6 +1002,7 @@ class Core:
                         del self._hist[:]
                         self.rate = 0.0
                     self._advance_job(self.chat or not self.cfg.get('enabled'))
+                    self._x_arm_tick(time.time())
                     wait = SAMPLE_EVERY
                 else:
                     self.reading = (time.time(), None, 'none')
@@ -1145,8 +1152,10 @@ class Core:
             self._bc_evt.set()                           # the waiting worker thread takes it from here
             text = 'safe backcast: %s, %s' % (vir[4], what)
         else:
-            self.flash_t = now
-            text = 'held back: %s, %s (casts at %g-%g%%)' % (sp[0][4], what, sp[0][2], sp[0][3])
+            # Not safe right now. Keep trying for a moment (and as long as X is held): the click goes out at the
+            # first moment it is safe - so pressing X a bit early while charging casts right as you enter the range.
+            self.x_arm_until, self.x_arm_key, self.x_key_down = now + X_ARM_FOR, self.armed, True
+            text = 'waiting: %s, %s (casts at %g-%g%%) - X stays ready' % (sp[0][4], what, sp[0][2], sp[0][3])
         self.last_event = (now, text)
         if not self.x_why:
             self.x_why = ('G %s, bar %s, speed %s, readings every %s ms' % (
@@ -1157,9 +1166,36 @@ class Core:
         return True
 
     def cast_up(self):
+        self.x_key_down = False
         if self.cast_btn:
             send_button(self.cast_btn, True)
             self.cast_btn = None
+
+    def _x_arm_tick(self, now):
+        """Every few ms: an armed X casts at the first moment it is safe."""
+        if self._x_up_t and now >= self._x_up_t:
+            send_button(self._x_btn, True)
+            self._x_up_t = 0.0
+        if not self.x_arm_until:
+            return
+        if (now > self.x_arm_until and not self.x_key_down) or self.armed != self.x_arm_key or self.chat \
+                or not self.cfg.get('enabled'):
+            if self.x_arm_until and now > self.x_arm_until and not self.x_key_down:
+                self.flash_t = now                       # it never got safe: show "held back"
+            self.x_arm_until = 0.0
+            return
+        if self.cast_btn or self.job or self._bc_active or self._x_up_t or now - self.last_cast_t < CAST_LOCK:
+            return
+        self.x_why = ''
+        s, pct, sp = self.castable(now)
+        if s is None:
+            return
+        send_button(s[1], False)
+        self._x_btn, self._x_up_t = s[1], now + CLICK_HOLD
+        self.casts += 1
+        self.last_cast_t = now
+        self.x_arm_until = 0.0
+        self._note('cast (%s click, X was ready): %s, mana %.1f%%   [%s]' % (s[1], s[4], pct, self.x_why))
 
     # -- the moving bar ---------------------------------------------------------------------------------------
     def _steady(self, now):
@@ -1313,7 +1349,8 @@ class Core:
             if self.g_is_down or now - self.g_up_t < behind:
                 return None, 'still learning your charge speed and bar delay (charge for a second, let go)'
             R = 0.0
-        self._real_sd = (R_sd or 0.1 * R)
+        # how much the charge speed varies: a few noisy measurements must not blow the margin up
+        self._real_sd = min(max(R_sd or 0.03 * R, 0.015 * R), 0.035 * R)
         start = max(self.g_down_t, at - behind)            # the bar already shows everything before this
         end = now if self.g_is_down else self.g_up_t
         if self.g_is_down and now - self.g_down_t > self.stun_wait() and pct - self.g_down_bar < 0.8:
@@ -2202,6 +2239,8 @@ def run_ui():
             ind.show('Anti-Backfire off', DIM, EDGE, '\u25c7') if (held or cfg.get('show_idle')) else ind.hide()
         elif core.job_label:
             ind.show(core.job_label + ('' if pct is None else '  \u00b7  %.0f%%' % pct), WARN)
+        elif held and core.x_arm_until:
+            ind.show('X ready' + ('' if pct is None else '  \u00b7  %.0f%%' % pct), WARN)
         elif held and now - core.flash_t < 0.4:
             ind.show('held back' + ('' if pct is None else '  \u00b7  %.0f%%' % pct), BAD, BAD, '\u2715')
         elif held:

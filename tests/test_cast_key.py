@@ -114,7 +114,7 @@ check("chat line open: typing 'x' never clicks", g.downs == 0)
 g = Game(); g.equip('-'); g.core.cfg['enabled'] = False; g.spam(3.0, 40.0)
 check('switched off (F9): X does nothing', g.downs == 0)
 g = Game(); g.equip('-'); g.spam(0.3, 0); g.spam(24.0 / 40, 40.0); g.core.reading = (clock[0] - 1, 24.0, 'bar'); g.core.last_cast_t = 0; g.key(X)
-check("mana bar can't be read: X holds back", g.core.cast_btn is None and 'held back' in g.core.last_event[1])
+check("mana bar can't be read: X holds back (and waits)", g.core.cast_btn is None and 'waiting' in g.core.last_event[1])
 g = Game(); g.equip('-'); g.spam(0.3, 0); g.spam(1.5, 40.0)
 check('X held back out of range: spell is STILL in your hand (mana shield works)', g.hand == '-' and g.keys_sent == 0 and g.core.armed == '-')
 
