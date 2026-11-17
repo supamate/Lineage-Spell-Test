@@ -101,7 +101,7 @@ mash('... laggy game (click lands 50 ms later, screen 33 ms late)', '-', 60.0, c
 mash('Telorum 80-90 (left click)', '7', 40.0)
 
 g = Game(); g.equip('-'); g.spam(0.3, 0); g.spam(24.0 / 40, 40.0)
-n = len(g.casts); g.key(X, up=False)
+n = len(g.casts); g.core.last_cast_t = 0; g.key(X, up=False)
 for _ in range(40): g.step()
 check('holding X holds the button down (one press, no release yet)', g.downs - g.ups == 1)
 g.key(X, down=False); check('releasing X releases it', g.downs == g.ups)
@@ -113,7 +113,7 @@ g = Game(); g.equip('-'); g.core.chat = True; g.spam(3.0, 40.0)
 check("chat line open: typing 'x' never clicks", g.downs == 0)
 g = Game(); g.equip('-'); g.core.cfg['enabled'] = False; g.spam(3.0, 40.0)
 check('switched off (F9): X does nothing', g.downs == 0)
-g = Game(); g.equip('-'); g.spam(0.3, 0); g.spam(24.0 / 40, 40.0); g.core.reading = (clock[0] - 1, 24.0, 'bar'); g.key(X)
+g = Game(); g.equip('-'); g.spam(0.3, 0); g.spam(24.0 / 40, 40.0); g.core.reading = (clock[0] - 1, 24.0, 'bar'); g.core.last_cast_t = 0; g.key(X)
 check("mana bar can't be read: X holds back", g.core.cast_btn is None and 'held back' in g.core.last_event[1])
 g = Game(); g.equip('-'); g.spam(0.3, 0); g.spam(1.5, 40.0)
 check('X held back out of range: spell is STILL in your hand (mana shield works)', g.hand == '-' and g.keys_sent == 0 and g.core.armed == '-')
@@ -124,7 +124,7 @@ c = ab.Core(dict(ab.DEFAULTS, spells=SPELLS)); c.set_main(mc); c.set_spells(SPEL
 c.game_focused = lambda: True; c.armed = '-'; ab.send_button = lambda *a: None
 worst = tot = 0.0
 for i in range(3000):
-    c.reading = (real_time.time(), 25.0, 'bar'); c.keys_down.clear()
+    c.reading = (real_time.time(), 25.0, 'bar'); c.keys_down.clear(); c.last_cast_t = 0
     t0 = real_time.perf_counter(); c._on_key(0, X, 0, True, False); c._on_key(0, X, 0, False, False)
     dt = real_time.perf_counter() - t0; worst = max(worst, dt); tot += dt
 check('X -> click decision is instant', worst < 0.005 and c.casts == 3000, 'avg %.3f ms, worst %.2f ms' % (tot / 3000 * 1000, worst * 1000))
