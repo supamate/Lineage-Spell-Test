@@ -86,6 +86,9 @@ DEFAULTS = {
     # Quick cast: time between pressing the spell's hotbar key and the click (the spell is only taken out once mana
     # is in range).
     'qc_equip_ms': 30.0,
+    # While charging: how much longer a click takes to reach the game than the G key (the mana keeps rising
+    # meanwhile).
+    'click_extra_ms': 30.0,
     'quick': [], 'qc_extra': 1.0, 'qc_timeout': 25.0,  # quick cast: [{'key': 'y', 'spell': 'Snap Snarvindur'}]
 }
 
@@ -824,6 +827,12 @@ class Core:
         self._speeds = [float(v) for v in (cfg.get('charge_speeds') or []) if (_num(v) or 0) > 3][-9:]
         self.user_hot_t = 0.0        # last time YOU pressed a hotbar key (a quick cast stops when you pick a slot)
         self.g_phys_t = 0.0          # when you last pressed G
+        self.g_is_down = False       # G is held for the game (by you or by a quick cast)
+        self.g_down_t = None         # when G last went down / up for the game, and the bar reading at that moment
+        self.g_up_t = 0.0
+        self.g_down_bar = 0.0
+        self._real_unseen = self._real_sd = 0.0
+        self._rise_open = False
         self.rate_short = 0.0        # bar speed over only the last ~45 ms (to tell a steady rise from a speeding-up one)
         self.x_why = ''              # why the last X decision went the way it did (written to the log)
         self.rate_ok = False         # enough recent readings to know how fast the bar moves
@@ -976,6 +985,13 @@ class Core:
                     self.reading = (now, pct, src)
                     if pct is not None:
                         self._track_rate(now, pct)
+                        if self._rise_open and self.g_is_down and self.g_down_t is not None:
+                            dt = now - self.g_down_t
+                            if pct - self.g_down_bar >= 0.8 and dt < 0.6:
+                                self._rise_open = False
+                                self._add_rise(dt)       # your press showed on the bar after dt
+                            elif dt >= 0.6:
+                                self._rise_open = False  # no rise (stunned / full): nothing to learn
                     else:
                         del self._hist[:]
                         self.rate = 0.0
@@ -1069,43 +1085,29 @@ class Core:
         if not sp or pct is None or now - at > STALE:
             return None, (pct if sp else None), sp
         ch = self.charging()
-        if ch:
-            # Holding G: the bar on screen is behind your REAL mana by (charge speed x lag). Judge the real mana -
-            # but only while the bar rises at a steady speed. While the charge is still speeding up (its slow
-            # start) the bar's speed reads too low, and right after pressing G the rise may not show yet at all:
-            # then nothing is safe to judge, so X holds back.
-            if not self.rate_ok:
-                self.x_why = 'G held, bar speed unknown (readings every %s ms)' % (
-                    '?' if self.sample_dt is None else '%.0f' % (self.sample_dt * 1000))
-                return None, pct, sp                     # can't tell if the bar is moving: not safe while charging
-            if self.g_phys and self.rate <= 2.0 and now - self.g_phys_t < self.stun_wait():
-                self.x_why = 'G pressed %.0f ms ago, charge not on the bar yet' % ((now - self.g_phys_t) * 1000)
-                return None, pct, sp                     # just pressed G: the rise may not be on the bar yet
-            if self.rate > 2.0:
-                if abs(self.rate_short - self.rate) > 0.15 * self.rate + 3.0:
-                    self.x_why = 'G held, bar speed unsteady (%.0f vs %.0f %%/s)' % (self.rate_short, self.rate)
-                    return None, pct, sp                 # its speed can't be trusted yet
-                behind, spread = self.bar_behind()
-                real = pct + self.rate * behind          # where your mana really is when the click lands
-                unc = 2.0 * spread * self.rate + 0.5
-                for s in sp:
-                    s2 = self.shifted(s, True)
-                    ok = self.allows(real - unc, [s2]) and self.allows(real + unc, [s2])
-                    self.x_why = ('G held, bar %.1f%% rising %.0f%%/s, %.0f ms behind -> real ~%.1f%% (+-%.1f), '
-                                  'allowed %g-%g, readings every %.0f ms' % (pct, self.rate, behind * 1000, real, unc,
-                                  s2[2], s2[3], (self.sample_dt or 0) * 1000))
-                    if ok:
-                        return s, pct, sp
+        behind, _ = self.bar_behind()
+        if self.g_down_t is not None and (self.g_is_down or now - self.g_up_t < behind + 0.08):
+            # Charging (or the bar is still catching up with a charge that just ended): judge the REAL mana.
+            self._real_unseen, self._real_sd = 0.0, 0.0
+            real, how = self.real_mana(now)
+            if real is None:
+                self.x_why = how
                 return None, pct, sp
-        if not self.rate_ok and self._hist and now - self._hist[-1][0] < 0.05 and len(self._hist) >= 2 and \
-                self._hist[-1][1] > self._hist[0][1] + 0.5:
-            self.x_why = 'bar rising, speed unknown (readings every %s ms)' % (
-                '?' if self.sample_dt is None else '%.0f' % (self.sample_dt * 1000))
-            return None, pct, sp
+            R, _ = self.charge_speed()
+            if self.g_is_down and R:                     # still rising while the click is on its way
+                real += R * _num(self.cfg.get('click_extra_ms'), 30.0) / 1000.0
+            # timing jitter of the click (~1.2 % at 60 %/s) + how much the charge speed itself varies
+            unc = 0.5 + (R or self.rate or 60.0) * 0.012 + 2.0 * self._real_sd * self._real_unseen
+            for s in sp:
+                s2 = self.shifted(s, ch)
+                ok = self.allows(real - unc, [s2]) and self.allows(real + unc, [s2])
+                self.x_why = 'G %s, real ~%.1f%% (%s), allowed %g-%g (+-%.1f)' % (
+                    'held' if ch else 'just let go', real, how, s2[2], s2[3], unc)
+                if ok:
+                    return s, real, sp
+            return None, real, sp
         lead = _num(self.cfg.get('cast_lead_ms'), 70.0) / 1000.0
-        if self.rate > 0:
-            lead = max(lead, self.lag)
-        ahead = min(100.0, max(0.0, pct + self.rate * lead))
+        ahead = min(100.0, max(0.0, pct + min(self.rate, 0.0) * lead))     # (mana only drains now)
         for s in sp:
             s2 = self.shifted(s, ch)
             if self.allows(pct, [s2]) and self.allows(ahead, [s2]):
@@ -1215,9 +1217,12 @@ class Core:
         it: how far the bar keeps going after G is let go (`lag`), and how long after a G press the bar starts
         rising (the same path your click takes to the game). The larger one is used."""
         b, sd = self.lag, self.lag_spread()
+        if len(self._rises) < 3:                         # not measured yet in your game: assume a cautious delay
+            return max(b, 0.25), 0.03
         if len(self._rises) >= 3:
             r = sorted(self._rises)
-            med = r[len(r) // 2] - 0.8 / max(self.rate, 20.0)     # (the rise is noticed after 0.8 % of mana)
+            R0 = self.charge_speed()[0] or max(self.rate, 40.0)
+            med = r[len(r) // 2] - 0.8 / R0                      # (the rise is noticed after 0.8 % of mana)
             dev = sorted(abs(x - r[len(r) // 2]) for x in r)
             rsd = max(0.004, 1.4826 * dev[len(dev) // 2])
             if med > b:
@@ -1274,7 +1279,50 @@ class Core:
             self._down.add((kind, x))
         else:
             self._down.discard((kind, x))
+        if kind == 'k' and x == G_SCAN:
+            self._g_event(down)
         send_button(x, not down) if kind == 'm' else send_scan(x, not down)
+
+    def _g_event(self, down):
+        held = self.g_phys or ('k', G_SCAN) in self._down
+        now = time.time()
+        if held and not self.g_is_down:
+            self.g_down_t = now
+            self.g_down_bar = self.reading[1] if self.reading[1] is not None else 0.0
+            self._rise_open = self.g_phys and not ('k', G_SCAN) in self._down   # learn from your own presses
+        elif not held and self.g_is_down:
+            self.g_up_t = now
+        self.g_is_down = held
+
+    def real_mana(self, now=None):
+        """-> (your REAL mana %, how it was worked out) - or (None, why) when the bar can't be read.
+        Your mana charges at a steady speed and the bar shows every change `behind` seconds late (learned). So the
+        real mana = the bar + speed x the part of the charge the bar hasn't shown yet: the time G has been down
+        (since the press, or since what the bar already shows, whichever is later), up to now - or up to when G
+        went up. No guessing from the bar's own speed, so slow screen readings can't fool it."""
+        now = time.time() if now is None else now
+        at, pct, src = self.reading
+        if pct is None or now - at > STALE:
+            return None, 'bar not readable'
+        if self.g_down_t is None:
+            return pct, 'bar'
+        behind, _ = self.bar_behind()
+        R, R_sd = self.charge_speed()
+        if R is None or len(self._rises) < 3:
+            # your charge speed / the bar's delay aren't measured yet (a second of charging teaches both)
+            if self.g_is_down or now - self.g_up_t < behind:
+                return None, 'still learning your charge speed and bar delay (charge for a second, let go)'
+            R = 0.0
+        self._real_sd = (R_sd or 0.1 * R)
+        start = max(self.g_down_t, at - behind)            # the bar already shows everything before this
+        end = now if self.g_is_down else self.g_up_t
+        if self.g_is_down and now - self.g_down_t > self.stun_wait() and pct - self.g_down_bar < 0.8:
+            return pct, 'G held but not charging (stunned?)'
+        unseen = max(0.0, end - start)
+        if unseen <= 0:
+            return pct, 'bar'
+        self._real_unseen = unseen
+        return min(100.0, pct + R * unseen), 'bar %.1f%% + %.0f%%/s x %.0f ms not shown yet' % (pct, R, unseen * 1000)
 
     def _backcast_worker(self):
         """Viribus backfired on purpose: the click is already down. Let it go, then put F (mana shield) down at
@@ -1493,6 +1541,7 @@ class Core:
             if down and not self.g_phys:
                 self.g_phys_t = time.time()
             self.g_phys = down                   # you are charging (only watched, never taken)
+            self._g_event(down)
         if ident in self._eaten:                 # a key of ours that is down: its repeats and its release
             if not down:
                 self._eaten.discard(ident)
@@ -2117,6 +2166,10 @@ def run_ui():
                 return
         focused = core.game_focused()
         pct, src = core.read_ui()
+        if pct is not None:
+            real, _how = core.real_mana(now)
+            if real is not None:
+                pct = real                           # while charging: your real mana, not the bar that trails it
         held = core.held()
         on = bool(cfg.get('enabled'))
         # status lines in the window

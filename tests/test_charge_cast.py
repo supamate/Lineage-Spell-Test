@@ -118,55 +118,52 @@ g = Game(charge=80.0, drain=-6.0, bar_lag=0.2, charge_lag_ms=120.0)
 g.g(True); g.run(45.0 / 80, x_every=0.06); g.g(False); g.run(8.0, x_every=0.06)
 check('... same, before the lag has been learned (120 ms guess, really 216 ms)', not g.backfires and g.casts, res(g))
 g = Game(charge=12.0, bar_lag=0.10, charge_lag_ms=116.0)
+g.core._rises = [0.12, 0.125, 0.118, 0.12, 0.122]; g.core._speeds = [12.0] * 5
 g.g(True); g.run(3.0, x_every=0.06)
 check('slow charge (12 %/s) while holding G: X casts during the charge', len(g.casts) >= 1 and not g.backfires, res(g))
 
-# ---------------------------------------------------------------- slow-then-fast charge (as in the real game)
-for top_speed, lag in ((70.0, 0.16), (110.0, 0.16), (70.0, 0.25)):
-    g = Game(charge=top_speed, v0=15.0, ramp=0.4, drain=-6.0, bar_lag=lag, charge_lag_ms=(lag + 0.016) * 1000)
-    g.g(True)
-    nxt = clock[0]
-    while g.mana < 45.0:                                   # hold G and mash X until well past the range
-        g.step()
-        if clock[0] >= nxt:
-            nxt += 0.05
-            g.tap(X)
-    g.g(False); g.run(8.0, x_every=0.05)
-    check('slow-then-fast charge to %3.0f %%/s, bar %3.0f ms behind: hold G + mash X' % (top_speed, lag * 1000),
-          not g.backfires and g.casts, res(g))
-late_bad = []
-for top_speed in (70.0, 110.0):
-    for when in [x / 100.0 for x in range(20, 95, 3)]:        # ONE X press, at every moment of a held charge
-        g = Game(charge=top_speed, v0=15.0, ramp=0.4, drain=-6.0, bar_lag=0.16, charge_lag_ms=176.0)
-        g.g(True); g.run(when); g.tap(X); g.run(1.0)
-        if g.backfires:
-            late_bad.append((top_speed, when, g.backfires[0]))
-check('one X press at any moment while holding G (incl. late, near the top): never a backfire', not late_bad,
-      str(late_bad[:5]))
+# ---------------------------------------------------------------- steady charge (as in the real game), late X
+for speed in (40.0, 60.0, 80.0, 110.0):
+    for learned in (True, False):
+        bad, casts = [], 0
+        for when in [x / 100.0 for x in range(0, 90, 3)]:      # ONE X press at every moment of a held charge
+            g = Game(charge=speed, drain=-6.0, bar_lag=0.17, charge_lag_ms=157.0 if learned else 120.0)
+            if learned:
+                g.core._rises = [0.183, 0.204, 0.19, 0.199, 0.2]
+                g.core._speeds = [speed] * 5
+            g.g(True); g.run(when); g.tap(X); g.run(1.0)
+            casts += len(g.casts)
+            bad += g.backfires
+        check('steady %3.0f %%/s, %s: one X at any moment while holding G -> never a backfire%s'
+              % (speed, 'learned' if learned else 'first use', ', and it casts' if learned else ' (holds back)'),
+              not bad and (casts > 0 or not learned), '%d backfires %s, %d casts' % (len(bad), bad[:3], casts))
 high_bad, high_casts = [], 0
-for start in (24.0, 26.0, 28.0):
-    for top_speed in (70.0, 110.0):
+for start in (22.0, 24.0, 26.0, 28.0):
+    for speed in (60.0, 110.0):
         for when in [x / 100.0 for x in range(0, 60, 2)]:    # mana already HIGH in the range, then G, then one X
-            g = Game(charge=top_speed, v0=15.0, ramp=0.4, drain=-1.0, bar_lag=0.16, charge_lag_ms=176.0, mana=start)
+            g = Game(charge=speed, drain=-1.0, bar_lag=0.17, charge_lag_ms=157.0, mana=start)
+            g.core._rises = [0.183, 0.204, 0.19, 0.199, 0.2]; g.core._speeds = [speed] * 5
             g.hist = [(clock[0], start)]
             g.run(0.3)
             g.g(True); g.run(when); g.tap(X); g.run(1.0)
             high_casts += len(g.casts)
             if g.backfires:
-                high_bad.append((start, top_speed, when, g.backfires[0]))
-check('mana already high in the range, press G, then X a moment later: never a backfire', not high_bad,
-      '%d backfires %s' % (len(high_bad), high_bad[:4]))
+                high_bad.append((start, speed, when, g.backfires[0]))
+check('mana already high in the range, press G, then X a moment later: never a backfire, and it does cast',
+      not high_bad and high_casts > 0,
+      '%d backfires %s, %d casts' % (len(high_bad), high_bad[:4], high_casts))
 
 # ---------------------------------------------------------------- slow screen readings (a busy PC while Roblox runs)
 for every in (0.025, 0.045, 0.07):
     bad, casts = [], 0
     for when in [x / 100.0 for x in range(15, 75, 2)]:      # steady 60 %/s (as in your game), one late X while holding G
         g = Game(charge=60.0, bar_lag=0.19, charge_lag_ms=157.0, read_every=every, drain=-1.0)
-        g.core._rises = [0.183, 0.204, 0.249, 0.199, 0.2]
+        g.core._rises = [0.183, 0.204, 0.249, 0.199, 0.2]; g.core._speeds = [60.0] * 5
         g.g(True); g.run(when); g.tap(X); g.run(1.0)
         casts += len(g.casts)
         bad += g.backfires
-    check('mana read only every %2.0f ms: hold G, one X at any moment -> never a backfire' % (every * 1000), not bad,
+    check('mana read only every %2.0f ms: hold G, one X at any moment -> never a backfire, and it casts' % (every * 1000),
+          not bad and casts > 0,
           '%d backfires %s, %d casts' % (len(bad), bad[:4], casts))
 
 # ---------------------------------------------------------------- the hidden shift itself
