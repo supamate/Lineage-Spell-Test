@@ -825,6 +825,10 @@ class Core:
         self.user_hot_t = 0.0        # last time YOU pressed a hotbar key (a quick cast stops when you pick a slot)
         self.g_phys_t = 0.0          # when you last pressed G
         self.rate_short = 0.0        # bar speed over only the last ~45 ms (to tell a steady rise from a speeding-up one)
+        self.x_why = ''              # why the last X decision went the way it did (written to the log)
+        self.rate_ok = False         # enough recent readings to know how fast the bar moves
+        self.sample_dt = None        # average time between two mana readings
+        self._slots_t = 0.0
         # how long after a G press the bar visibly starts rising (lag + the charge's slow start), learned
         self._rises = [float(v) for v in (cfg.get('rise_delays') or []) if 0.02 < (_num(v) or 0) < 1.5][-9:]
         self._rise_since = None
@@ -964,7 +968,9 @@ class Core:
                 hw = self._roblox_foreground() if (main and main.ok) else None
                 self.game_hwnd = hw
                 if hw:
-                    self.sync_slots('samp')
+                    if time.time() - self._slots_t >= 0.03:
+                        self._slots_t = time.time()
+                        self.sync_slots('samp')
                     pct, src = self._read('samp', learn=True)
                     now = time.time()
                     self.reading = (now, pct, src)
@@ -1068,19 +1074,34 @@ class Core:
             # but only while the bar rises at a steady speed. While the charge is still speeding up (its slow
             # start) the bar's speed reads too low, and right after pressing G the rise may not show yet at all:
             # then nothing is safe to judge, so X holds back.
+            if not self.rate_ok:
+                self.x_why = 'G held, bar speed unknown (readings every %s ms)' % (
+                    '?' if self.sample_dt is None else '%.0f' % (self.sample_dt * 1000))
+                return None, pct, sp                     # can't tell if the bar is moving: not safe while charging
             if self.g_phys and self.rate <= 2.0 and now - self.g_phys_t < self.stun_wait():
+                self.x_why = 'G pressed %.0f ms ago, charge not on the bar yet' % ((now - self.g_phys_t) * 1000)
                 return None, pct, sp                     # just pressed G: the rise may not be on the bar yet
             if self.rate > 2.0:
                 if abs(self.rate_short - self.rate) > 0.15 * self.rate + 3.0:
-                    return None, pct, sp                 # still speeding up: its speed can't be trusted yet
-                spread = self.lag_spread()
-                real = pct + self.rate * self.lag        # where your mana really is when the click lands
-                unc = 2.0 * (spread if spread is not None else 0.03) * self.rate + 0.5
+                    self.x_why = 'G held, bar speed unsteady (%.0f vs %.0f %%/s)' % (self.rate_short, self.rate)
+                    return None, pct, sp                 # its speed can't be trusted yet
+                behind, spread = self.bar_behind()
+                real = pct + self.rate * behind          # where your mana really is when the click lands
+                unc = 2.0 * spread * self.rate + 0.5
                 for s in sp:
                     s2 = self.shifted(s, True)
-                    if self.allows(real - unc, [s2]) and self.allows(real + unc, [s2]):
+                    ok = self.allows(real - unc, [s2]) and self.allows(real + unc, [s2])
+                    self.x_why = ('G held, bar %.1f%% rising %.0f%%/s, %.0f ms behind -> real ~%.1f%% (+-%.1f), '
+                                  'allowed %g-%g, readings every %.0f ms' % (pct, self.rate, behind * 1000, real, unc,
+                                  s2[2], s2[3], (self.sample_dt or 0) * 1000))
+                    if ok:
                         return s, pct, sp
                 return None, pct, sp
+        if not self.rate_ok and self._hist and now - self._hist[-1][0] < 0.05 and len(self._hist) >= 2 and \
+                self._hist[-1][1] > self._hist[0][1] + 0.5:
+            self.x_why = 'bar rising, speed unknown (readings every %s ms)' % (
+                '?' if self.sample_dt is None else '%.0f' % (self.sample_dt * 1000))
+            return None, pct, sp
         lead = _num(self.cfg.get('cast_lead_ms'), 70.0) / 1000.0
         if self.rate > 0:
             lead = max(lead, self.lag)
@@ -1096,6 +1117,7 @@ class Core:
         (the key is ours and hidden from the game)."""
         if not self.cfg.get('enabled') or self.chat or not self.game_focused():
             return False
+        self.x_why = ''
         s, pct, sp = self.castable()
         if not sp:
             return False                                 # no listed spell in your hand: the key is left alone
@@ -1124,7 +1146,12 @@ class Core:
             self.flash_t = now
             text = 'held back: %s, %s (casts at %g-%g%%)' % (sp[0][4], what, sp[0][2], sp[0][3])
         self.last_event = (now, text)
-        self._logq.append(text)
+        if not self.x_why:
+            self.x_why = ('G %s, bar %s, speed %s, readings every %s ms' % (
+                'held' if self.charging() else 'not held', '?' if pct is None else '%.1f%%' % pct,
+                '%.0f%%/s' % self.rate if self.rate_ok else 'unknown',
+                '?' if self.sample_dt is None else '%.0f' % (self.sample_dt * 1000)))
+        self._logq.append(text + '   [' + self.x_why + ']')
         return True
 
     def cast_up(self):
@@ -1136,7 +1163,9 @@ class Core:
     def _steady(self, now):
         """The bar is not rising any more (standing still, or draining slowly) over the last ~70 ms."""
         pts = [(at, v) for at, v in self._hist if now - at <= 0.07]
-        return len(pts) >= 3 and pts[-1][1] - pts[0][1] <= 0.4
+        if len(pts) < 3:
+            pts = self._hist[-3:]
+        return len(pts) >= 3 and now - pts[0][0] <= 0.2 and pts[-1][1] - pts[0][1] <= 0.4
 
     def _start_probe(self, now, d0, r0):
         self._probe = [now, d0, r0, d0]                  # time G went up, bar then, its speed, highest bar since
@@ -1180,6 +1209,20 @@ class Core:
         self._rises = (self._rises + [min(1.5, max(0.02, v))])[-9:]
         self.cfg['rise_delays'] = [round(x, 3) for x in self._rises]
         self.lag_dirty = True
+
+    def bar_behind(self):
+        """-> (seconds the bar trails your real mana while it charges, how much that varies). Two measurements of
+        it: how far the bar keeps going after G is let go (`lag`), and how long after a G press the bar starts
+        rising (the same path your click takes to the game). The larger one is used."""
+        b, sd = self.lag, self.lag_spread()
+        if len(self._rises) >= 3:
+            r = sorted(self._rises)
+            med = r[len(r) // 2] - 0.8 / max(self.rate, 20.0)     # (the rise is noticed after 0.8 % of mana)
+            dev = sorted(abs(x - r[len(r) // 2]) for x in r)
+            rsd = max(0.004, 1.4826 * dev[len(dev) // 2])
+            if med > b:
+                b, sd = med, max(rsd, sd or 0.0)
+        return b, (sd if sd is not None else 0.03)
 
     def stun_wait(self):
         """How long after pressing G a charge would surely be visible. Re-tapping sooner would restart a charge that
@@ -1393,7 +1436,7 @@ class Core:
     def _track_rate(self, now, pct):
         h = self._hist
         h.append((now, pct))
-        while h and now - h[0][0] > 0.12:
+        while h and now - h[0][0] > 0.3:
             h.pop(0)
         sp = [(at, v) for at, v in h if now - at <= 0.045]
         if len(sp) >= 3 and sp[-1][0] - sp[0][0] >= 0.02:
@@ -1404,8 +1447,14 @@ class Core:
             self.rate_short = sum((at - mt2) * (v - mv2) for at, v in sp) / den2 if den2 > 0 else 0.0
         else:
             self.rate_short = 0.0
+        if len(h) >= 2:
+            dt = h[-1][0] - h[-2][0]
+            self.sample_dt = dt if self.sample_dt is None else 0.9 * self.sample_dt + 0.1 * dt
         pts = [(at, v) for at, v in h if now - at <= 0.09]
-        if len(pts) < 4 or pts[-1][0] - pts[0][0] < 0.03:
+        if len(pts) < 4:                                 # readings came in slowly: use the last 4 (up to 300 ms)
+            pts = [(at, v) for at, v in h if now - at <= 0.3][-4:]
+        self.rate_ok = len(pts) >= 4 and pts[-1][0] - pts[0][0] >= 0.02
+        if not self.rate_ok:
             self.rate = 0.0
         else:                                            # least-squares slope: one noisy reading can't swing it
             n = float(len(pts))
