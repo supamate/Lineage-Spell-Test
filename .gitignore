@@ -1,0 +1,5 @@
+# personal settings, logs and caches stay on this PC
+anti_backfire.json
+anti_backfire.json.tmp
+anti_backfire.log
+__pycache__/
