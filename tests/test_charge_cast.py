@@ -24,7 +24,7 @@ def check(name, cond, extra=''):
 
 class Game:
     def __init__(self, charge=80.0, drain=-2.0, bar_lag=0.10, key_delay=0.016, click_delay=0.045, hand='-',
-                 mana=0.0, **cfg):
+                 mana=0.0, v0=None, ramp=0.4, **cfg):
         c = self.core = ab.Core(dict(ab.DEFAULTS, spells=SPELLS, leeway=1.0, margin=1.0, quick=QUICK, **cfg))
         c.set_main(mc); c.set_spells(SPELLS); c.set_quick(QUICK); c.reader.mask = bytes(mc.strip[3])
         c.game_focused = lambda: True
@@ -32,6 +32,7 @@ class Game:
         self.hand, self.mana, self.charge, self.drain = hand, mana, charge, drain
         self.bar_lag, self.key_delay, self.click_delay = bar_lag, key_delay, click_delay
         self.game_g = False
+        self.v0, self.ramp, self.g_start = v0, ramp, None    # v0 set: the charge starts at v0 and speeds up
         self.pending, self.hist, self.casts, self.backfires = [], [], [], []
         ab.send_button, ab.send_scan = self.button, self.scan
 
@@ -62,6 +63,8 @@ class Game:
         for q in [q for q in self.pending if q[0] <= now]:
             self.pending.remove(q)
             if q[1] == 'g':
+                if q[2] and not self.game_g:
+                    self.g_start = now
                 self.game_g = q[2]
             elif q[1] == 'key':
                 self.hand = None if self.hand == q[2] else q[2]
@@ -70,7 +73,10 @@ class Game:
                 (self.casts if lo <= self.mana <= hi else self.backfires).append(round(self.mana, 1))
                 if lo <= self.mana <= hi:
                     self.mana = 0.0
-        self.mana = min(100.0, max(0.0, self.mana + (self.charge if self.game_g else self.drain) * DT))
+        v = self.charge
+        if self.v0 is not None and self.g_start is not None:
+            v = min(self.charge, self.v0 + (self.charge - self.v0) * (now - self.g_start) / self.ramp)
+        self.mana = min(100.0, max(0.0, self.mana + (v if self.game_g else self.drain) * DT))
         self.hist.append((now, self.mana))
         while len(self.hist) > 2 and self.hist[1][0] <= now - self.bar_lag:
             self.hist.pop(0)
@@ -111,6 +117,42 @@ check('... same, before the lag has been learned (120 ms guess, really 216 ms)',
 g = Game(charge=12.0, bar_lag=0.10, charge_lag_ms=116.0)
 g.g(True); g.run(3.0, x_every=0.06)
 check('slow charge (12 %/s) while holding G: X casts during the charge', len(g.casts) >= 1 and not g.backfires, res(g))
+
+# ---------------------------------------------------------------- slow-then-fast charge (as in the real game)
+for top_speed, lag in ((70.0, 0.16), (110.0, 0.16), (70.0, 0.25)):
+    g = Game(charge=top_speed, v0=15.0, ramp=0.4, drain=-6.0, bar_lag=lag, charge_lag_ms=(lag + 0.016) * 1000)
+    g.g(True)
+    nxt = clock[0]
+    while g.mana < 45.0:                                   # hold G and mash X until well past the range
+        g.step()
+        if clock[0] >= nxt:
+            nxt += 0.05
+            g.tap(X)
+    g.g(False); g.run(8.0, x_every=0.05)
+    check('slow-then-fast charge to %3.0f %%/s, bar %3.0f ms behind: hold G + mash X' % (top_speed, lag * 1000),
+          not g.backfires and g.casts, res(g))
+late_bad = []
+for top_speed in (70.0, 110.0):
+    for when in [x / 100.0 for x in range(20, 95, 3)]:        # ONE X press, at every moment of a held charge
+        g = Game(charge=top_speed, v0=15.0, ramp=0.4, drain=-6.0, bar_lag=0.16, charge_lag_ms=176.0)
+        g.g(True); g.run(when); g.tap(X); g.run(1.0)
+        if g.backfires:
+            late_bad.append((top_speed, when, g.backfires[0]))
+check('one X press at any moment while holding G (incl. late, near the top): never a backfire', not late_bad,
+      str(late_bad[:5]))
+high_bad, high_casts = [], 0
+for start in (24.0, 26.0, 28.0):
+    for top_speed in (70.0, 110.0):
+        for when in [x / 100.0 for x in range(0, 60, 2)]:    # mana already HIGH in the range, then G, then one X
+            g = Game(charge=top_speed, v0=15.0, ramp=0.4, drain=-1.0, bar_lag=0.16, charge_lag_ms=176.0, mana=start)
+            g.hist = [(clock[0], start)]
+            g.run(0.3)
+            g.g(True); g.run(when); g.tap(X); g.run(1.0)
+            high_casts += len(g.casts)
+            if g.backfires:
+                high_bad.append((start, top_speed, when, g.backfires[0]))
+check('mana already high in the range, press G, then X a moment later: never a backfire', not high_bad,
+      '%d backfires %s' % (len(high_bad), high_bad[:4]))
 
 # ---------------------------------------------------------------- the hidden shift itself
 c = Game(bar_lag=0.0).core

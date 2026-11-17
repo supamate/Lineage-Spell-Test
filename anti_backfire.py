@@ -823,6 +823,8 @@ class Core:
         self._probe = None           # after quick cast lets go of G: watch where the bar peaks, to learn the lag
         self._speeds = [float(v) for v in (cfg.get('charge_speeds') or []) if (_num(v) or 0) > 3][-9:]
         self.user_hot_t = 0.0        # last time YOU pressed a hotbar key (a quick cast stops when you pick a slot)
+        self.g_phys_t = 0.0          # when you last pressed G
+        self.rate_short = 0.0        # bar speed over only the last ~45 ms (to tell a steady rise from a speeding-up one)
         # how long after a G press the bar visibly starts rising (lag + the charge's slow start), learned
         self._rises = [float(v) for v in (cfg.get('rise_delays') or []) if 0.02 < (_num(v) or 0) < 1.5][-9:]
         self._rise_since = None
@@ -1060,11 +1062,29 @@ class Core:
         at, pct, src = self.reading
         if not sp or pct is None or now - at > STALE:
             return None, (pct if sp else None), sp
+        ch = self.charging()
+        if ch:
+            # Holding G: the bar on screen is behind your REAL mana by (charge speed x lag). Judge the real mana -
+            # but only while the bar rises at a steady speed. While the charge is still speeding up (its slow
+            # start) the bar's speed reads too low, and right after pressing G the rise may not show yet at all:
+            # then nothing is safe to judge, so X holds back.
+            if self.g_phys and self.rate <= 2.0 and now - self.g_phys_t < self.stun_wait():
+                return None, pct, sp                     # just pressed G: the rise may not be on the bar yet
+            if self.rate > 2.0:
+                if abs(self.rate_short - self.rate) > 0.15 * self.rate + 3.0:
+                    return None, pct, sp                 # still speeding up: its speed can't be trusted yet
+                spread = self.lag_spread()
+                real = pct + self.rate * self.lag        # where your mana really is when the click lands
+                unc = 2.0 * (spread if spread is not None else 0.03) * self.rate + 0.5
+                for s in sp:
+                    s2 = self.shifted(s, True)
+                    if self.allows(real - unc, [s2]) and self.allows(real + unc, [s2]):
+                        return s, pct, sp
+                return None, pct, sp
         lead = _num(self.cfg.get('cast_lead_ms'), 70.0) / 1000.0
         if self.rate > 0:
             lead = max(lead, self.lag)
         ahead = min(100.0, max(0.0, pct + self.rate * lead))
-        ch = self.charging()
         for s in sp:
             s2 = self.shifted(s, ch)
             if self.allows(pct, [s2]) and self.allows(ahead, [s2]):
@@ -1375,6 +1395,15 @@ class Core:
         h.append((now, pct))
         while h and now - h[0][0] > 0.12:
             h.pop(0)
+        sp = [(at, v) for at, v in h if now - at <= 0.045]
+        if len(sp) >= 3 and sp[-1][0] - sp[0][0] >= 0.02:
+            n2 = float(len(sp))
+            mt2 = sum(at for at, _ in sp) / n2
+            mv2 = sum(v for _, v in sp) / n2
+            den2 = sum((at - mt2) ** 2 for at, _ in sp)
+            self.rate_short = sum((at - mt2) * (v - mv2) for at, v in sp) / den2 if den2 > 0 else 0.0
+        else:
+            self.rate_short = 0.0
         pts = [(at, v) for at, v in h if now - at <= 0.09]
         if len(pts) < 4 or pts[-1][0] - pts[0][0] < 0.03:
             self.rate = 0.0
@@ -1412,6 +1441,8 @@ class Core:
         """-> True when the key is one of this add-on's own (cast key / quick cast) and is hidden from the game."""
         ident = (scan, ext)
         if scan == G_SCAN and not ext and not ours:
+            if down and not self.g_phys:
+                self.g_phys_t = time.time()
             self.g_phys = down                   # you are charging (only watched, never taken)
         if ident in self._eaten:                 # a key of ours that is down: its repeats and its release
             if not down:
