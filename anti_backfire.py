@@ -551,12 +551,111 @@ def effective_range(lo, hi, leeway, margin):
 
 
 # --------------------------------------------------------------------------------- the main tool's config
+CONFIG_NAME = 'cooldown_indicator_config.json'
+
+
+def _is_tool_name(name):
+    n = name.lower()
+    return n.endswith('.exe') and (n == TOOL_EXE.lower() or ('lineage' in n and ('assist' in n or 'tool' in n)))
+
+
+def running_tool_dirs():
+    """Folders of every running copy of the Assist Tool (it keeps its config next to its exe)."""
+    out = []
+    snap = kernel32.CreateToolhelp32Snapshot(0x2, 0)
+    if not snap or snap == wt.HANDLE(-1).value:
+        return out
+    try:
+        e = PROCESSENTRY32W()
+        e.dwSize = ctypes.sizeof(e)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(e))
+        while ok:
+            if _is_tool_name(e.szExeFile):
+                h = kernel32.OpenProcess(0x1000, False, e.th32ProcessID)
+                if h:
+                    try:
+                        buf = ctypes.create_unicode_buffer(520)
+                        n = wt.DWORD(520)
+                        if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+                            d = os.path.dirname(buf.value)
+                            if d not in out:
+                                out.append(d)
+                    finally:
+                        kernel32.CloseHandle(h)
+            ok = kernel32.Process32NextW(snap, ctypes.byref(e))
+    finally:
+        kernel32.CloseHandle(snap)
+    return out
+
+
+def _user_folders():
+    home = os.path.expanduser('~')
+    out = []
+    for csidl in (0x10, 0x05):                       # the REAL Desktop and Documents (they can be moved to another drive)
+        buf = ctypes.create_unicode_buffer(520)
+        try:
+            if ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buf) == 0 and os.path.isdir(buf.value):
+                out.append(buf.value)
+        except Exception:
+            pass
+    for sub in ('Desktop', 'Downloads', 'Documents', os.path.join('OneDrive', 'Desktop'),
+                os.path.join('OneDrive', 'Documents')):
+        d = os.path.join(home, sub)
+        if os.path.isdir(d):
+            out.append(d)
+    return out
+
+
+def _shallow_find(base, name, depth):
+    """`name` in base or up to `depth` folders below it (no deep crawling)."""
+    base = os.path.abspath(base)
+    lvl0 = base.rstrip(os.sep).count(os.sep)
+    for root, dirs, files in os.walk(base):
+        if name in files:
+            return os.path.join(root, name)
+        if root.count(os.sep) - lvl0 >= depth:
+            dirs[:] = []
+        else:
+            dirs[:] = [d for d in dirs if not d.startswith(('.', '$')) and d.lower() not in
+                       ('node_modules', 'appdata', 'windows', 'program files', '__pycache__')]
+    return ''
+
+
 def find_main_config(hint=''):
-    for p in (hint, os.path.join(APP_DIR, '..', 'cooldown_indicator_config.json'),
-              os.path.join(APP_DIR, 'cooldown_indicator_config.json')):
+    """Where the Assist Tool keeps its settings: the place picked before, the running tool's folder, the folder
+    around this add-on, then a short look through Desktop / Downloads / Documents."""
+    cands = [hint]
+    cands += [os.path.join(d, CONFIG_NAME) for d in running_tool_dirs()]
+    cands += [os.path.join(APP_DIR, '..', CONFIG_NAME), os.path.join(APP_DIR, CONFIG_NAME)]
+    for p in cands:
         if p and os.path.isfile(p):
             return os.path.abspath(p)
+    for base in [os.path.abspath(os.path.join(APP_DIR, '..', '..'))] + _user_folders():
+        try:
+            f = _shallow_find(base, CONFIG_NAME, 3)
+        except OSError:
+            f = ''
+        if f:
+            return os.path.abspath(f)
     return ''
+
+
+def find_tool_exe(config_path=''):
+    """The Assist Tool's exe: next to its config (any name with 'lineage' + 'assist'/'tool'), else next to us."""
+    for d in [os.path.dirname(config_path) if config_path else '', os.path.abspath(os.path.join(APP_DIR, '..'))]:
+        if not d or not os.path.isdir(d):
+            continue
+        if os.path.isfile(os.path.join(d, TOOL_EXE)):
+            return os.path.join(d, TOOL_EXE)
+        for f in sorted(os.listdir(d)):
+            if _is_tool_name(f):
+                return os.path.join(d, f)
+    return ''
+
+
+def tool_running(exe_path=''):
+    name = os.path.basename(exe_path) if exe_path else TOOL_EXE
+    return process_running(name)
 
 
 def _num(v, d=None):
@@ -1349,13 +1448,19 @@ def run_ui():
     from tkinter import ttk, filedialog, messagebox
 
     set_dpi_aware()
-    tool_dir = os.path.abspath(os.path.join(APP_DIR, '..'))
-    tool_path = os.path.join(tool_dir, TOOL_EXE)
     launch = '--launch-tool' in sys.argv
+    early_cfg = {}
+    try:
+        with open(CFG_PATH, encoding='utf-8') as f:
+            early_cfg = json.load(f)
+    except (OSError, ValueError):
+        pass
+    tool = {'path': find_tool_exe(early_cfg.get('main_config') or find_main_config(early_cfg.get('main_config', '')))}
 
     def start_tool():
-        if launch and os.path.isfile(tool_path) and process_running(TOOL_EXE) is False:
-            os.startfile(tool_path)
+        p = tool['path']
+        if launch and p and os.path.isfile(p) and tool_running(p) is False:
+            os.startfile(p)
             return True
         return False
 
@@ -1418,6 +1523,7 @@ def run_ui():
         mc = MainConfig(path)
         state['main'] = mc
         cfg['main_config'] = path
+        tool['path'] = find_tool_exe(path) or tool['path']
         if mc.ok:
             core.set_main(mc)
 
@@ -1793,12 +1899,20 @@ def run_ui():
                 apply()
         if show_evt and kernel32.WaitForSingleObject(show_evt, 0) == 0:
             show_settings()
+        if mc is None and now - state.get('cfg_look', 0.0) > 5.0:
+            state['cfg_look'] = now                  # not found yet: keep looking (e.g. the tool was started later)
+            found = find_main_config('')
+            if found:
+                load_main(found)
+                apply()
+                save_soon()
+                mc = state['main']
         if not state['shown_once'] and ((not mc or not mc.ok) or (core.start_done and not core.hook_ok)):
             state['shown_once'] = True               # something is wrong: say so instead of staying invisible
             show_settings()
         if launch and cfg.get('follow_tool') and now - state['tool_check'] > 2.0:
             state['tool_check'] = now
-            if process_running(TOOL_EXE):
+            if tool_running(tool['path']):
                 state['tool_seen'] = now
             elif state['tool_seen'] and now - state['tool_seen'] > 4.0:
                 on_close()                           # the main tool was closed: close with it

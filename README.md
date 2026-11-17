@@ -27,13 +27,44 @@ take a real click away from it without a driver. Cast with the cast key instead.
 - The Rogue Lineage Assist Tool, with its mana bar and hotbar positions set up. Anti-Backfire reads its
   `cooldown_indicator_config.json` from the folder above this one.
 
-## Running it
+## Setup (about 2 minutes)
 
-Put this folder next to the Assist Tool, then start `Anti-Backfire.pyw` (or `anti_backfire.py`). It runs in the
-background without a window. Start it again to open the settings, where you list your spells, their mana
-ranges, the quick cast keys and the timings.
+1. **Set up the Rogue Lineage Assist Tool first.** Start it, use "Find Mana Bar", and make sure all 12 hotbar
+   slots are filled so it finds your hotbar. It saves this in `cooldown_indicator_config.json` next to its exe.
+2. **Install Python** from [python.org](https://www.python.org/downloads/) if you don't have it (3.11 or newer).
+3. **Download this repo** (green "Code" button → "Download ZIP"), unzip it, and put the folder **inside the folder
+   that holds the Assist Tool's `.exe`**.
+4. **Make the shortcut:** double-click `create_shortcut.py` (or run `py create_shortcut.py`). It finds the Assist
+   Tool and puts a shortcut called **Rogue Lineage Assist Tool + Anti-Backfire** in the tool's folder and on your
+   Desktop.
+5. **Double-click that shortcut.** It starts the Assist Tool and Anti-Backfire together; Anti-Backfire runs
+   silently and closes when the tool closes. Double-click it again while they run to open the settings, then list
+   your spells, their mana ranges and your quick cast keys.
 
-`--launch-tool` also starts the Assist Tool and closes together with it.
+### Finding the Assist Tool's settings
+
+You don't have to point Anti-Backfire at anything. It finds `cooldown_indicator_config.json` on its own, in
+this order:
+
+1. the file you picked before,
+2. the folder of the Assist Tool while it is running,
+3. the folder this add-on sits in, and the one above it,
+4. a short search of your Desktop, Documents and Downloads (3 folders deep).
+
+If it still can't find it (the settings window opens and says so), click **Find main tool config…** and pick
+the file yourself. If the tool is started later, Anti-Backfire notices within a few seconds.
+
+### Running it without the shortcut
+
+Start `Anti-Backfire.pyw` (or `anti_backfire.py`). It runs in the background without a window; start it again to
+open the settings. `--launch-tool` also starts the Assist Tool and closes together with it.
+
+### Defaults to check
+
+- **Leeway** starts at 2 % (for Fallion training). Set it to 0 if you don't have it.
+- **Snap Snarvindur** is pre-filled at 20–30 %. Check every range against your own spells.
+- **Viribus backcast timing** (F 488 ms after the click, held 579 ms) was measured on one PC; adjust it in the
+  settings if your mana shield comes up too early or too late.
 
 ## How it knows things
 
